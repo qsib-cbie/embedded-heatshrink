@@ -343,6 +343,9 @@ mod tests {
             }
         }
 
+        println!("Running {} configurations", configurations.len());
+        let t0 = Instant::now();
+
         let mut results: Vec<RoundtripConfig> = configurations
             .into_par_iter()
             .map(
@@ -418,5 +421,8 @@ mod tests {
         for i in (results.len() - 3)..results.len() {
             println!("{:?}", results[i]);
         }
+
+        let t1 = Instant::now();
+        println!("Completed permutations in {:?}", t1 - t0);
     }
 }

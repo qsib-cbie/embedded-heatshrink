@@ -74,9 +74,9 @@ const MATCH_NOT_FOUND: u16 = u16::MAX;
 
 pub struct HeatshrinkEncoder {
     /// bytes in input buffer
-    input_size: u16,
-    match_scan_index: u16,
-    match_length: u16,
+    input_size: usize,
+    match_scan_index: usize,
+    match_length: usize,
     match_pos: u16,
     /// enqueued outgoing bits
     outgoing_bits: u16,
@@ -92,6 +92,10 @@ pub struct HeatshrinkEncoder {
     window_sz2: u8,
     /// 2^n size of lookahead
     lookahead_sz2: u8,
+    /// size of window
+    window_size: usize,
+    /// size of lookahead
+    lookahead_size: usize,
     /// search index
     /// using dynamic allocation
     search_index: Vec<i16>,
@@ -138,6 +142,8 @@ impl HeatshrinkEncoder {
             bit_index: 0x80,
             window_sz2,
             lookahead_sz2,
+            window_size: 1 << window_sz2,
+            lookahead_size: 1 << lookahead_sz2,
             search_index: vec![0; buf_sz],
             buffer: vec![0; buf_sz],
         })
@@ -165,15 +171,14 @@ impl HeatshrinkEncoder {
         let write_offset = self.get_input_offset() + self.input_size;
         let ibs = self.get_input_buffer_size();
         let rem = ibs - self.input_size;
-        let cp_sz = min(rem as usize, in_buf.len()); // 0 if full
+        let cp_sz = min(rem, in_buf.len()); // 0 if full
 
         // Copy as many bytes as possible into the input buffer
-        self.buffer[write_offset as usize..write_offset as usize + cp_sz]
-            .copy_from_slice(&in_buf[..cp_sz]);
-        self.input_size += cp_sz as u16;
+        self.buffer[write_offset..write_offset + cp_sz].copy_from_slice(&in_buf[..cp_sz]);
+        self.input_size += cp_sz;
 
         // If the input buffer is full, then caller needs to poll to progress
-        if cp_sz == rem as usize {
+        if cp_sz == rem {
             self.state = HSEState::Filled;
         }
 
@@ -310,7 +315,7 @@ impl HeatshrinkEncoder {
             if self.push_outgoing_bits(oi) > 0 {
                 HSEState::YieldBrIndex // continue
             } else {
-                self.outgoing_bits = self.match_length - 1;
+                self.outgoing_bits = (self.match_length - 1) as u16;
                 self.outgoing_bits_count = self.get_lookahead_bits();
                 HSEState::YieldBrLength // done
             }
@@ -359,18 +364,18 @@ impl HeatshrinkEncoder {
     }
 
     #[inline]
-    fn get_input_offset(&self) -> u16 {
+    fn get_input_offset(&self) -> usize {
         self.get_input_buffer_size()
     }
 
     #[inline]
-    fn get_input_buffer_size(&self) -> u16 {
-        1 << self.window_sz2
+    fn get_input_buffer_size(&self) -> usize {
+        self.window_size
     }
 
     #[inline]
-    fn get_lookahead_size(&self) -> u16 {
-        1 << self.lookahead_sz2
+    fn get_lookahead_size(&self) -> usize {
+        self.lookahead_size
     }
 
     #[inline]
@@ -383,10 +388,9 @@ impl HeatshrinkEncoder {
         let index = &mut self.search_index;
         let end = input_offset + self.input_size;
         for i in 0..end {
-            let v = data[i as usize];
-            let lv = last[v as usize];
-            index[i as usize] = lv;
-            last[v as usize] = i as i16;
+            let v = data[i] as usize;
+            index[i] = last[v];
+            last[v] = i as i16;
         }
     }
 
@@ -401,18 +405,23 @@ impl HeatshrinkEncoder {
     }
 
     #[inline]
-    fn find_longest_match(&self, start: u16, end: u16, maxlen: u16, match_length: &mut u16) -> u16 {
+    fn find_longest_match(
+        &self,
+        start: usize,
+        end: usize,
+        maxlen: usize,
+        match_length: &mut usize,
+    ) -> u16 {
         let buf = &self.buffer;
 
-        let maxlen = maxlen as usize;
         let mut match_maxlen = 0;
         let mut match_index = MATCH_NOT_FOUND;
 
-        let needlepoint = &buf[end as usize..];
+        let needlepoint = &buf[end..];
         let hsi = &self.search_index;
-        let mut pos = hsi[end as usize];
+        let mut pos = hsi[end];
         let break_even_point =
-            (1 + self.get_window_bits() + self.get_lookahead_bits()) as usize / 8;
+            ((1 + self.get_window_bits() + self.get_lookahead_bits()) / 8) as usize;
         while pos - (start as i16) >= 0 {
             if pos < 0 {
                 // Write to stderr
@@ -422,10 +431,11 @@ impl HeatshrinkEncoder {
                     start, end, maxlen, pos, start
                 );
             }
-            let pospoint = &buf[pos as usize..];
+            let posidx = pos as usize;
+            let pospoint = &buf[posidx..];
 
-            if pospoint[match_maxlen as usize] != needlepoint[match_maxlen as usize] {
-                pos = hsi[pos as usize];
+            if pospoint[match_maxlen] != needlepoint[match_maxlen] {
+                pos = hsi[posidx];
                 continue;
             }
 
@@ -444,12 +454,12 @@ impl HeatshrinkEncoder {
                     break;
                 }
             }
-            pos = hsi[pos as usize];
+            pos = hsi[posidx];
         }
 
         if match_maxlen > break_even_point {
-            *match_length = match_maxlen as u16;
-            end - match_index
+            *match_length = match_maxlen;
+            end as u16 - match_index
         } else {
             MATCH_NOT_FOUND
         }
@@ -502,26 +512,22 @@ impl HeatshrinkEncoder {
     fn push_literal_byte(&mut self, oi: &mut OutputInfo) {
         let processed_offset = self.match_scan_index - 1;
         let input_offset = self.get_input_offset() + processed_offset;
-        let c = self.buffer[input_offset as usize];
+        let c = self.buffer[input_offset];
         self.push_bits(8, c, oi);
     }
 
     #[inline]
     fn save_backlog(&mut self) {
         let input_buf_sz = self.get_input_buffer_size();
-
         let msi = self.match_scan_index;
-
         let rem = input_buf_sz - msi;
         let shift_sz = input_buf_sz + rem;
 
         unsafe {
-            ptr::copy_nonoverlapping(
-                self.buffer
-                    .as_ptr()
-                    .add(input_buf_sz as usize - rem as usize),
+            ptr::copy(
+                self.buffer.as_ptr().add(input_buf_sz - rem),
                 self.buffer.as_mut_ptr(),
-                shift_sz as usize,
+                shift_sz,
             );
         }
 
