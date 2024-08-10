@@ -352,7 +352,7 @@ mod tests {
         println!("Running {} configurations", configurations.len());
         let t0 = Instant::now();
 
-        let mut results: Vec<RoundtripConfig> = configurations
+        let results: Vec<RoundtripConfig> = configurations
             .into_par_iter()
             .map(
                 |(window_sz2, lookahead_sz2, in_read_sz, out_read_sz, out_buffer_sz, data)| {
@@ -398,6 +398,11 @@ mod tests {
             )
             .collect();
 
+        // Only print out results for real data
+        let mut results = results
+            .into_iter()
+            .filter(|r| r.file_name == "tsz-compressed-data.bin")
+            .collect::<Vec<_>>();
         // Print top 3 and bottom 3 compression ratios
         results.sort_by(|a, b| {
             a.compression_ratio
