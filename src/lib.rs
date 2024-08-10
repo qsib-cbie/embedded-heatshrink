@@ -30,6 +30,7 @@ pub const HEATSHRINK_MIN_LOOKAHEAD_BITS: u8 = 3;
 /// One-shot stream encode the input into a finished compressed buffer.
 ///
 pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usize) -> Vec<u8> {
+    assert!(read_sz > 0, "read_sz must be greater than 0");
     let mut encoder =
         HeatshrinkEncoder::new(window_sz2, lookahead_sz2).expect("Failed to create encoder");
     let mut compressed = vec![];
@@ -50,7 +51,7 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
                 HSESinkRes::Ok(bytes_sunk) => {
                     read_data = &read_data[bytes_sunk..];
                 }
-                _ => panic!("Failed to sink data: {:?}", sink_res),
+                _ => unreachable!(),
             }
 
             loop {
@@ -62,7 +63,7 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
                     HSEPollRes::More(sz) => {
                         compressed.extend(&scratch[..sz]);
                     }
-                    e => panic!("Failed to poll data: {:?}", e),
+                    HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
                 }
             }
         }
@@ -76,7 +77,8 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
             HSEFinishRes::Done => {
                 break;
             }
-            _ => {}
+            HSEFinishRes::More => {}
+            HSEFinishRes::ErrorNull => unreachable!(),
         }
 
         loop {
@@ -88,7 +90,7 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
                 HSEPollRes::More(sz) => {
                     compressed.extend(&scratch[..sz]);
                 }
-                e => panic!("Failed to poll data: {:?}", e),
+                HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
             }
         }
     }
@@ -103,6 +105,7 @@ pub fn decode_all(
     lookahead_sz2: u8,
     read_sz: usize,
 ) -> Vec<u8> {
+    assert!(read_sz > 0, "read_sz must be greater than 0");
     let mut decoder = HeatshrinkDecoder::new(input_buffer_size as u16, window_sz2, lookahead_sz2)
         .expect("Failed to create decoder");
     let mut decompressed = vec![];
@@ -123,7 +126,7 @@ pub fn decode_all(
                 HSDSinkRes::Ok(bytes_sunk) => {
                     read_data = &read_data[bytes_sunk..];
                 }
-                _ => panic!("Failed to sink data: {:?}", sink_res),
+                _ => unreachable!(),
             }
 
             loop {
@@ -135,6 +138,7 @@ pub fn decode_all(
                     HSDPollRes::More(sz) => {
                         decompressed.extend(&scratch[..sz]);
                     }
+                    HSDPollRes::ErrorNull => unreachable!(),
                     e => panic!("Failed to poll data: {:?}", e),
                 }
             }
@@ -149,7 +153,8 @@ pub fn decode_all(
             HSDFinishRes::Done => {
                 break;
             }
-            _ => {}
+            HSDFinishRes::More => {}
+            HSDFinishRes::ErrorNull => unreachable!(),
         }
 
         loop {
@@ -161,6 +166,7 @@ pub fn decode_all(
                 HSDPollRes::More(sz) => {
                     decompressed.extend(&scratch[..sz]);
                 }
+                HSDPollRes::ErrorNull => unreachable!(),
                 e => panic!("Failed to poll data: {:?}", e),
             }
         }

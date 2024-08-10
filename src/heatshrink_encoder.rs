@@ -92,8 +92,8 @@ pub struct HeatshrinkEncoder {
     window_sz2: u8,
     /// 2^n size of lookahead
     lookahead_sz2: u8,
-    /// size of window
-    window_size: usize,
+    /// size of window and input buffer
+    input_buffer_size: usize,
     /// size of lookahead
     lookahead_size: usize,
     /// search index
@@ -142,7 +142,7 @@ impl HeatshrinkEncoder {
             bit_index: 0x80,
             window_sz2,
             lookahead_sz2,
-            window_size: 1 << window_sz2,
+            input_buffer_size: 1 << window_sz2,
             lookahead_size: 1 << lookahead_sz2,
             search_index: vec![0; buf_sz],
             buffer: vec![0; buf_sz],
@@ -150,27 +150,67 @@ impl HeatshrinkEncoder {
     }
 
     ///
+    /// Sink all of the bytes in in_buf to the encoder, if bytes must be emitted
+    /// they are emitted to out_buf. The number of bytes actually emitted is returned.
+    ///
+    /// If the return value is HSER_POLL_MORE, then the out_buf is full and the
+    /// number of bytes sunk from in_buf are returned.
+    /// Otherwise, HSER_POLL_EMPTY is returned with the number of bytes emitted to out_buf.
+    #[inline]
+    pub fn sink_all(&mut self, in_buf: &[u8], out_buf: &mut [u8]) -> HSEPollRes {
+        if out_buf.is_empty() {
+            return HSEPollRes::ErrorMisuse;
+        }
 
+        let mut sunk = 0;
+        let mut polled = 0;
+        while sunk < in_buf.len() {
+            match self.sink(in_buf) {
+                HSESinkRes::Ok(sz) => {
+                    sunk += sz;
+                }
+                _ => {
+                    return HSEPollRes::ErrorMisuse;
+                }
+            }
+
+            loop {
+                if polled == out_buf.len() {
+                    return HSEPollRes::More(sunk);
+                }
+                match self.poll(&mut out_buf[polled..]) {
+                    HSEPollRes::Empty(sz) => {
+                        polled += sz;
+                        break;
+                    }
+                    HSEPollRes::More(sz) => {
+                        polled += sz;
+                    }
+                    e => unreachable!("Logic error: {:?}", e),
+                }
+            }
+        }
+
+        HSEPollRes::Empty(sunk)
+    }
+
+    ///
     /// Sink up to `in_buf.len()` bytes from `in_buf` into the encoder.
     /// the number of bytes actually sunk is returned on success.
+    ///
+    /// Do not provide an empty in_buf
     #[inline]
     pub fn sink(&mut self, in_buf: &[u8]) -> HSESinkRes {
-        if in_buf.is_empty() {
-            return HSESinkRes::ErrorNull;
-        }
-
-        if self.is_finishing() {
-            return HSESinkRes::ErrorMisuse;
-        }
-
-        if self.state != HSEState::NotFull {
+        // TODO: remove these checks and improve the docs instead
+        // These checks are in the hot loop of pushing data through the encoder
+        // this function gets called roughly O(n / 100) times for O(n) bytes of input
+        if (self.is_finishing()) | (self.state != HSEState::NotFull) {
             return HSESinkRes::ErrorMisuse;
         }
 
         // Calculate the offset and remaining bytes at the end of the input buffer window
         let write_offset = self.get_input_offset() + self.input_size;
-        let ibs = self.get_input_buffer_size();
-        let rem = ibs - self.input_size;
+        let rem = self.input_buffer_size - self.input_size;
         let cp_sz = min(rem, in_buf.len()); // 0 if full
 
         // Copy as many bytes as possible into the input buffer
@@ -187,15 +227,11 @@ impl HeatshrinkEncoder {
 
     /// Poll for output from the encoder, copying at most `out_buf.len()` bytes
     /// into `out_buf`. The number of bytes actually copied is returned on success.
+    ///
+    /// Do not provide an empty out_buf
+    ///
     #[inline]
     pub fn poll(&mut self, out_buf: &mut [u8]) -> HSEPollRes {
-        if out_buf.is_empty() {
-            return HSEPollRes::ErrorNull;
-        }
-        if out_buf.len() == 0 {
-            return HSEPollRes::ErrorMisuse;
-        }
-
         // Looping through states will fill the output buffer, accumulating the output size
         let mut output_size = 0;
         let mut oi = OutputInfo {
@@ -245,8 +281,8 @@ impl HeatshrinkEncoder {
 
     #[inline]
     fn st_step_search(&mut self) -> HSEState {
-        let window_length = self.get_input_buffer_size();
-        let lookahead_sz = self.get_lookahead_size();
+        let window_length = self.input_buffer_size;
+        let lookahead_sz = self.lookahead_size;
         let msi = self.match_scan_index;
 
         let fin = self.is_finishing();
@@ -365,17 +401,7 @@ impl HeatshrinkEncoder {
 
     #[inline]
     fn get_input_offset(&self) -> usize {
-        self.get_input_buffer_size()
-    }
-
-    #[inline]
-    fn get_input_buffer_size(&self) -> usize {
-        self.window_size
-    }
-
-    #[inline]
-    fn get_lookahead_size(&self) -> usize {
-        self.lookahead_size
+        self.input_buffer_size
     }
 
     #[inline]
@@ -518,21 +544,19 @@ impl HeatshrinkEncoder {
 
     #[inline]
     fn save_backlog(&mut self) {
-        let input_buf_sz = self.get_input_buffer_size();
-        let msi = self.match_scan_index;
-        let rem = input_buf_sz - msi;
-        let shift_sz = input_buf_sz + rem;
+        let rem = self.input_buffer_size - self.match_scan_index;
+        let shift_sz = self.input_buffer_size + rem;
 
         unsafe {
             ptr::copy(
-                self.buffer.as_ptr().add(input_buf_sz - rem),
+                self.buffer.as_ptr().add(self.input_buffer_size - rem),
                 self.buffer.as_mut_ptr(),
                 shift_sz,
             );
         }
 
         self.match_scan_index = 0;
-        self.input_size -= input_buf_sz - rem;
+        self.input_size -= self.input_buffer_size - rem;
     }
 
     ///
@@ -600,108 +624,4 @@ mod tests {
             output_buffer[..written].to_vec()
         );
     }
-
-    // #[test]
-    // fn identical_output() {
-    //     // Load the raw bytes at tsz-compressed-data.bin, Compress and byte compare tsz-compressed-data.bin.hs
-    //     let test_data = include_bytes!("../tsz-compressed-data.bin");
-    //     // let test_data = include_bytes!("../test.txt");
-    //     let mut encoder = HeatshrinkEncoder::new(8, 7).expect("Failed to create encoder");
-    //     // println!("Compressing {:02X?}", test_data.as_slice());
-
-    //     // Sink the test data 256 bytes at a time
-    //     let mut written = 0;
-    //     let mut output_buffer = [0; 256];
-    //     let mut compressed: Vec<u8> = vec![];
-    //     while written < test_data.len() {
-    //         let num_bytes = min(256, test_data.len() - written);
-    //         let sink_res = encoder.sink(&test_data[written..written + num_bytes]);
-    //         println!(
-    //             "Sink result: {:?} {} of {}",
-    //             sink_res,
-    //             written,
-    //             test_data.len()
-    //         );
-    //         match sink_res {
-    //             HSESinkRes::Ok(sz) => {
-    //                 written += sz;
-    //             }
-    //             _ => {}
-    //         }
-
-    //         loop {
-    //             let poll_res = encoder.poll(&mut output_buffer);
-    //             println!("Poll result: {:?}", poll_res);
-    //             match poll_res {
-    //                 HSEPollRes::More(sz) => {
-    //                     compressed.extend(&output_buffer[..sz]);
-    //                 }
-    //                 HSEPollRes::Empty(sz) => {
-    //                     compressed.extend(&output_buffer[..sz]);
-    //                     break;
-    //                 }
-    //                 e => {
-    //                     println!("Unexpected poll result: {:?}", e);
-    //                     break;
-    //                 }
-    //             }
-    //         }
-    //     }
-
-    //     let mut finish_res = encoder.finish();
-    //     println!("Finish result: {:?}", finish_res);
-    //     while finish_res == HSEFinishRes::More {
-    //         let poll_res = encoder.poll(&mut output_buffer);
-    //         println!("Poll result: {:?}", poll_res);
-    //         match poll_res {
-    //             HSEPollRes::Empty(sz) | HSEPollRes::More(sz) => {
-    //                 written += sz;
-    //                 compressed.extend(&output_buffer[..sz]);
-    //             }
-    //             _ => {}
-    //         }
-
-    //         finish_res = encoder.finish();
-    //         println!("Finish result: {:?}", finish_res);
-    //     }
-
-    //     println!("Wrote {} bytes", compressed.len());
-
-    //     // Compare the compressed data with the expected data
-    //     let precompressed = include_bytes!("../tsz-compressed-data.bin.hs");
-    //     // let precompressed = include_bytes!("../test.txt.hs");
-    //     // println!(
-    //     //     "Compressed {} bytes: {:02X?}",
-    //     //     compressed.len(),
-    //     //     compressed.as_slice()
-    //     // );
-    //     // println!(
-    //     //     "Expected {} bytes: {:02X?}",
-    //     //     precompressed.len(),
-    //     //     precompressed.as_slice()
-    //     // );
-
-    //     println!(
-    //         "Compressed {} bytes, expected {} bytes",
-    //         compressed.len(),
-    //         precompressed.len()
-    //     );
-    //     for i in 0..compressed.len() {
-    //         assert_eq!(
-    //             compressed[i],
-    //             precompressed[i],
-    //             "Mismatch at index {} of {}",
-    //             i,
-    //             compressed.len()
-    //         );
-    //     }
-    //     assert_eq!(
-    //         compressed.len(),
-    //         precompressed.len(),
-    //         "Compressed {} bytes into {}, but expected {}",
-    //         test_data.len(),
-    //         compressed.len(),
-    //         precompressed.len()
-    //     );
-    // }
 }
