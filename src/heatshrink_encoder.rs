@@ -448,7 +448,8 @@ impl HeatshrinkEncoder {
         let mut pos = hsi[end];
         let break_even_point =
             ((1 + self.get_window_bits() + self.get_lookahead_bits()) / 8) as usize;
-        while pos - (start as i16) >= 0 {
+        let start = start as i16;
+        while pos >= start && pos >= 0 {
             if pos < 0 {
                 // Write to stderr
                 eprintln!(

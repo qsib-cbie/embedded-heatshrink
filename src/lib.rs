@@ -23,7 +23,7 @@ pub use heatshrink_encoder::*;
 
 /// Heatshrink constant limits
 pub const HEATSHRINK_MIN_WINDOW_BITS: u8 = 4;
-pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 14; // 15; // I notice some issues with 15 window_sz2: 15, lookahead_sz2: 5, start: 2, end: 32770, maxlen: 5, pos: -32767 start: 2 thread '<unnamed>' panicked at src/heatshrink_encoder.rs:425:32: range start index 18446744073709518849 out of range for slice of length 65536
+pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 15; // there may be some strangeness with 15
 pub const HEATSHRINK_MIN_LOOKAHEAD_BITS: u8 = 3;
 
 ///
@@ -291,44 +291,6 @@ mod tests {
 
         // Use several different input buffer sizes to stress different code paths
         let input_buffer_sizes = [1, 64, 512, 8192];
-
-        // // Run the permutations, tracking the best and worst compression ratios and times
-        // let mut results = vec![];
-        // for (window_sz2, lookahead_sz2) in window_lookahead_pairs {
-        //     for (in_read_sz, out_read_sz) in read_size_pairs.iter() {
-        //         for out_buffer_sz in input_buffer_sizes.iter() {
-        //             for data in data.iter() {
-        //                 let t0 = Instant::now();
-        //                 let (compressed, decompressed) = roundtrip(
-        //                     data.1,
-        //                     window_sz2,
-        //                     lookahead_sz2,
-        //                     *in_read_sz,
-        //                     *out_read_sz,
-        //                     *out_buffer_sz,
-        //                 );
-        //                 let t1 = Instant::now();
-        //                 let elapsed = t1 - t0;
-        //                 let elapsed_us = elapsed.as_micros();
-        //                 let compression_ratio = compressed.len() as f32 / data.1.len() as f32;
-        //                 let config = RoundtripConfig {
-        //                     window_sz2,
-        //                     lookahead_sz2,
-        //                     in_read_sz: *in_read_sz,
-        //                     out_read_sz: *out_read_sz,
-        //                     out_buffer_sz: *out_buffer_sz,
-        //                     file_name: data.0,
-        //                     compressed_size: compressed.len(),
-        //                     compression_ratio,
-        //                     compression_time_us: elapsed_us as usize,
-        //                 };
-        //                 println!("{:?}", config);
-        //                 assert_eq!(data.1, decompressed.as_slice());
-        //                 results.push(config);
-        //             }
-        //         }
-        //     }
-        // }
 
         // Use rayon to run all the permutations in parallel
         let mut configurations = vec![];
