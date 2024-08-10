@@ -1,0 +1,701 @@
+// use alloc::vec;
+// use alloc::vec::Vec;
+use core::cmp::min;
+use core::ptr;
+
+use crate::{
+    common::*, HEATSHRINK_MAX_WINDOW_BITS, HEATSHRINK_MIN_LOOKAHEAD_BITS,
+    HEATSHRINK_MIN_WINDOW_BITS,
+};
+
+// Define result types for encoding operations
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum HSESinkRes {
+    /// data sunk into input buffer
+    /// returns the number of bytes actually sunk
+    Ok(usize),
+    /// NULL argument
+    ErrorNull,
+    /// misuse of API
+    ErrorMisuse,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum HSEPollRes {
+    /// input exhausted
+    /// returns the number of bytes actually copied
+    Empty(usize),
+    /// poll again for more output
+    /// returns the number of bytes actually copied
+    More(usize),
+    /// NULL argument
+    ErrorNull,
+    /// misuse of API
+    ErrorMisuse,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum HSEFinishRes {
+    /// encoding is completed
+    Done,
+    /// more output remaining; use poll
+    More,
+    /// NULL argument
+    ErrorNull,
+}
+
+// Define the states for the encoder state machine
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum HSEState {
+    /// input buffer not full enough
+    NotFull,
+    /// buffer is full
+    Filled,
+    /// searching for patterns
+    Search,
+    /// yield tag bit
+    YieldTagBit,
+    /// emit literal byte
+    YieldLiteral,
+    /// yielding backref index
+    YieldBrIndex,
+    /// yielding backref length
+    YieldBrLength,
+    /// copying buffer to backlog
+    SaveBacklog,
+    /// flush bit buffer
+    FlushBits,
+    /// done
+    Done,
+}
+
+// Define constants for match not found
+const MATCH_NOT_FOUND: u16 = u16::MAX;
+
+pub struct HeatshrinkEncoder {
+    /// bytes in input buffer
+    input_size: u16,
+    match_scan_index: u16,
+    match_length: u16,
+    match_pos: u16,
+    /// enqueued outgoing bits
+    outgoing_bits: u16,
+    outgoing_bits_count: u8,
+    flags: u8,
+    /// current state machine node
+    state: HSEState,
+    /// current byte of output
+    current_byte: u8,
+    /// current bit index
+    bit_index: u8,
+    /// 2^n size of window
+    window_sz2: u8,
+    /// 2^n size of lookahead
+    lookahead_sz2: u8,
+    /// search index
+    /// using dynamic allocation
+    search_index: Vec<i16>,
+    /// input buffer and / sliding window for expansion
+    /// using dynamic allocation
+    buffer: Vec<u8>,
+}
+
+impl HeatshrinkEncoder {
+    ///
+    ///  Initialize the `HeatshrinkEncoder` with:
+    ///    * 1<<window_sz2 byte window for the current input
+    ///    * 1<<window_sz2 byte window for the previous input, for backreferences
+    ///    * 1<<lookahead_sz2 byte lookahead
+    ///
+    /// ```rust
+    /// use tsz_heatshrink::HeatshrinkEncoder;
+    /// let mut encoder = HeatshrinkEncoder::new(8, 4).expect("Failed to create encoder");
+    /// ```
+    pub fn new(window_sz2: u8, lookahead_sz2: u8) -> Option<Self> {
+        if window_sz2 < HEATSHRINK_MIN_WINDOW_BITS
+            || window_sz2 > HEATSHRINK_MAX_WINDOW_BITS
+            || lookahead_sz2 < HEATSHRINK_MIN_LOOKAHEAD_BITS
+            || lookahead_sz2 >= window_sz2
+        {
+            return None;
+        }
+
+        // the buffer needs to fit the 1 << window_sz2 bytes for the current input and
+        // the 1 << window_sz2 bytes for the previous input, which will be scanned
+        // for useful backreferences.
+        let buf_sz = (2 << window_sz2) as usize;
+
+        Some(HeatshrinkEncoder {
+            input_size: 0,
+            match_scan_index: 0,
+            match_length: 0,
+            match_pos: 0,
+            outgoing_bits: 0,
+            outgoing_bits_count: 0,
+            flags: 0,
+            state: HSEState::NotFull,
+            current_byte: 0,
+            bit_index: 0x80,
+            window_sz2,
+            lookahead_sz2,
+            search_index: vec![0; buf_sz],
+            buffer: vec![0; buf_sz],
+        })
+    }
+
+    ///
+
+    /// Sink up to `in_buf.len()` bytes from `in_buf` into the encoder.
+    /// the number of bytes actually sunk is returned on success.
+    #[inline]
+    pub fn sink(&mut self, in_buf: &[u8]) -> HSESinkRes {
+        if in_buf.is_empty() {
+            return HSESinkRes::ErrorNull;
+        }
+
+        if self.is_finishing() {
+            return HSESinkRes::ErrorMisuse;
+        }
+
+        if self.state != HSEState::NotFull {
+            return HSESinkRes::ErrorMisuse;
+        }
+
+        // Calculate the offset and remaining bytes at the end of the input buffer window
+        let write_offset = self.get_input_offset() + self.input_size;
+        let ibs = self.get_input_buffer_size();
+        let rem = ibs - self.input_size;
+        let cp_sz = min(rem as usize, in_buf.len()); // 0 if full
+
+        // Copy as many bytes as possible into the input buffer
+        self.buffer[write_offset as usize..write_offset as usize + cp_sz]
+            .copy_from_slice(&in_buf[..cp_sz]);
+        self.input_size += cp_sz as u16;
+
+        // If the input buffer is full, then caller needs to poll to progress
+        if cp_sz == rem as usize {
+            self.state = HSEState::Filled;
+        }
+
+        HSESinkRes::Ok(cp_sz)
+    }
+
+    /// Poll for output from the encoder, copying at most `out_buf.len()` bytes
+    /// into `out_buf`. The number of bytes actually copied is returned on success.
+    #[inline]
+    pub fn poll(&mut self, out_buf: &mut [u8]) -> HSEPollRes {
+        if out_buf.is_empty() {
+            return HSEPollRes::ErrorNull;
+        }
+        if out_buf.len() == 0 {
+            return HSEPollRes::ErrorMisuse;
+        }
+
+        // Looping through states will fill the output buffer, accumulating the output size
+        let mut output_size = 0;
+        let mut oi = OutputInfo {
+            buf: out_buf,
+            output_size: &mut output_size,
+        };
+        loop {
+            let in_state = self.state;
+            self.state = match in_state {
+                HSEState::Done | HSEState::NotFull => return HSEPollRes::Empty(output_size),
+                HSEState::Filled => {
+                    self.do_indexing();
+                    HSEState::Search
+                }
+                HSEState::Search => self.st_step_search(),
+                HSEState::YieldTagBit => self.st_yield_tag_bit(&mut oi),
+                HSEState::YieldLiteral => self.st_yield_literal(&mut oi),
+                HSEState::YieldBrIndex => self.st_yield_br_index(&mut oi),
+                HSEState::YieldBrLength => self.st_yield_br_length(&mut oi),
+                HSEState::SaveBacklog => self.st_save_backlog(),
+                HSEState::FlushBits => self.st_flush_bit_buffer(&mut oi),
+            };
+
+            if self.state == in_state {
+                if *oi.output_size == oi.buf.len() {
+                    return HSEPollRes::More(output_size);
+                }
+            }
+        }
+    }
+
+    /// Notify the encoder that the input stream is finished.
+    /// If the return value is HSER_FINISH_MORE, there is more output to poll, so
+    /// call poll until it returns HSER_FINISH_DONE.
+    pub fn finish(&mut self) -> HSEFinishRes {
+        self.flags |= FLAG_IS_FINISHING;
+        if self.state == HSEState::NotFull {
+            // Mark the input filled to trigger indexing and emission of the remaining data
+            self.state = HSEState::Filled;
+        }
+        if self.state == HSEState::Done {
+            HSEFinishRes::Done
+        } else {
+            HSEFinishRes::More
+        }
+    }
+
+    #[inline]
+    fn st_step_search(&mut self) -> HSEState {
+        let window_length = self.get_input_buffer_size();
+        let lookahead_sz = self.get_lookahead_size();
+        let msi = self.match_scan_index;
+
+        let fin = self.is_finishing();
+        if msi > self.input_size - (if fin { 1 } else { lookahead_sz }) {
+            return if fin {
+                HSEState::FlushBits
+            } else {
+                HSEState::SaveBacklog
+            };
+        }
+
+        let input_offset = self.get_input_offset();
+        let end = input_offset + msi;
+        let start = end - window_length;
+
+        let mut max_possible = lookahead_sz;
+        if self.input_size - msi < lookahead_sz {
+            max_possible = self.input_size - msi;
+        }
+
+        let mut match_length = 0;
+        let match_pos = self.find_longest_match(start, end, max_possible, &mut match_length);
+
+        if match_pos == MATCH_NOT_FOUND {
+            self.match_scan_index += 1;
+            self.match_length = 0;
+            HSEState::YieldTagBit
+        } else {
+            self.match_pos = match_pos;
+            self.match_length = match_length;
+            debug_assert!(match_pos <= 1 << self.window_sz2); // matching within window size
+            HSEState::YieldTagBit
+        }
+    }
+
+    #[inline]
+    fn st_yield_tag_bit(&mut self, oi: &mut OutputInfo) -> HSEState {
+        if self.can_take_byte(oi) {
+            if self.match_length == 0 {
+                self.add_tag_bit(oi, HEATSHRINK_LITERAL_MARKER);
+                HSEState::YieldLiteral
+            } else {
+                self.add_tag_bit(oi, HEATSHRINK_BACKREF_MARKER);
+                self.outgoing_bits = self.match_pos - 1;
+                self.outgoing_bits_count = self.get_window_bits();
+                HSEState::YieldBrIndex
+            }
+        } else {
+            HSEState::YieldTagBit
+        }
+    }
+
+    #[inline]
+    fn st_yield_literal(&mut self, oi: &mut OutputInfo) -> HSEState {
+        if self.can_take_byte(oi) {
+            self.push_literal_byte(oi);
+            HSEState::Search
+        } else {
+            HSEState::YieldLiteral
+        }
+    }
+
+    #[inline]
+    fn st_yield_br_index(&mut self, oi: &mut OutputInfo) -> HSEState {
+        if self.can_take_byte(oi) {
+            if self.push_outgoing_bits(oi) > 0 {
+                HSEState::YieldBrIndex // continue
+            } else {
+                self.outgoing_bits = self.match_length - 1;
+                self.outgoing_bits_count = self.get_lookahead_bits();
+                HSEState::YieldBrLength // done
+            }
+        } else {
+            HSEState::YieldBrIndex // continue
+        }
+    }
+
+    #[inline]
+    fn st_yield_br_length(&mut self, oi: &mut OutputInfo) -> HSEState {
+        if self.can_take_byte(oi) {
+            if self.push_outgoing_bits(oi) > 0 {
+                HSEState::YieldBrLength
+            } else {
+                self.match_scan_index += self.match_length;
+                self.match_length = 0;
+                HSEState::Search
+            }
+        } else {
+            HSEState::YieldBrLength
+        }
+    }
+
+    #[inline]
+    fn st_save_backlog(&mut self) -> HSEState {
+        self.save_backlog();
+        HSEState::NotFull
+    }
+
+    #[inline]
+    fn st_flush_bit_buffer(&mut self, oi: &mut OutputInfo) -> HSEState {
+        if self.bit_index == 0x80 {
+            HSEState::Done
+        } else if self.can_take_byte(oi) {
+            oi.buf[*oi.output_size] = self.current_byte;
+            *oi.output_size += 1;
+            HSEState::Done
+        } else {
+            HSEState::FlushBits
+        }
+    }
+
+    #[inline]
+    fn add_tag_bit(&mut self, oi: &mut OutputInfo, tag: u8) {
+        self.push_bits(1, tag, oi);
+    }
+
+    #[inline]
+    fn get_input_offset(&self) -> u16 {
+        self.get_input_buffer_size()
+    }
+
+    #[inline]
+    fn get_input_buffer_size(&self) -> u16 {
+        1 << self.window_sz2
+    }
+
+    #[inline]
+    fn get_lookahead_size(&self) -> u16 {
+        1 << self.lookahead_sz2
+    }
+
+    #[inline]
+    fn do_indexing(&mut self) {
+        const FILL: i16 = -1;
+        let mut last: [i16; 256] = [FILL; 256];
+
+        let data = &self.buffer;
+        let input_offset = self.get_input_offset();
+        let index = &mut self.search_index;
+        let end = input_offset + self.input_size;
+        for i in 0..end {
+            let v = data[i as usize];
+            let lv = last[v as usize];
+            index[i as usize] = lv;
+            last[v as usize] = i as i16;
+        }
+    }
+
+    #[inline]
+    fn is_finishing(&self) -> bool {
+        self.flags & FLAG_IS_FINISHING == FLAG_IS_FINISHING
+    }
+
+    #[inline]
+    fn can_take_byte(&self, oi: &OutputInfo) -> bool {
+        *oi.output_size < oi.buf.len()
+    }
+
+    #[inline]
+    fn find_longest_match(&self, start: u16, end: u16, maxlen: u16, match_length: &mut u16) -> u16 {
+        let buf = &self.buffer;
+
+        let maxlen = maxlen as usize;
+        let mut match_maxlen = 0;
+        let mut match_index = MATCH_NOT_FOUND;
+
+        let needlepoint = &buf[end as usize..];
+        let hsi = &self.search_index;
+        let mut pos = hsi[end as usize];
+        let break_even_point =
+            (1 + self.get_window_bits() + self.get_lookahead_bits()) as usize / 8;
+        while pos - (start as i16) >= 0 {
+            if pos < 0 {
+                // Write to stderr
+                eprintln!(
+                    "window_sz2: {}, lookahead_sz2: {}, start: {}, end: {}, maxlen: {}, pos: {} start: {}",
+                    self.window_sz2, self.lookahead_sz2,
+                    start, end, maxlen, pos, start
+                );
+            }
+            let pospoint = &buf[pos as usize..];
+
+            if pospoint[match_maxlen as usize] != needlepoint[match_maxlen as usize] {
+                pos = hsi[pos as usize];
+                continue;
+            }
+
+            let mut len = 1;
+            while len < maxlen {
+                if pospoint[len] != needlepoint[len] {
+                    break;
+                }
+                len += 1;
+            }
+
+            if len > match_maxlen {
+                match_maxlen = len;
+                match_index = pos as u16;
+                if len == maxlen {
+                    break;
+                }
+            }
+            pos = hsi[pos as usize];
+        }
+
+        if match_maxlen > break_even_point {
+            *match_length = match_maxlen as u16;
+            end - match_index
+        } else {
+            MATCH_NOT_FOUND
+        }
+    }
+
+    #[inline]
+    fn push_outgoing_bits(&mut self, oi: &mut OutputInfo) -> u8 {
+        let count: u8;
+        let bits: u8;
+        if self.outgoing_bits_count > 8 {
+            count = 8;
+            bits = (self.outgoing_bits >> (self.outgoing_bits_count - 8)) as u8;
+        } else {
+            count = self.outgoing_bits_count;
+            bits = self.outgoing_bits as u8;
+        }
+
+        if count > 0 {
+            self.push_bits(count, bits, oi);
+            self.outgoing_bits_count -= count;
+        }
+        count
+    }
+
+    #[inline]
+    fn push_bits(&mut self, count: u8, bits: u8, oi: &mut OutputInfo) {
+        debug_assert!(count <= 8);
+
+        if count == 8 && self.bit_index == 0x80 {
+            oi.buf[*oi.output_size] = bits;
+            *oi.output_size += 1;
+        } else {
+            for i in (0..count).rev() {
+                let bit = bits & (1 << i) != 0;
+                if bit {
+                    self.current_byte |= self.bit_index;
+                }
+                self.bit_index >>= 1;
+                if self.bit_index == 0x00 {
+                    self.bit_index = 0x80;
+                    oi.buf[*oi.output_size] = self.current_byte;
+                    *oi.output_size += 1;
+                    self.current_byte = 0x00;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn push_literal_byte(&mut self, oi: &mut OutputInfo) {
+        let processed_offset = self.match_scan_index - 1;
+        let input_offset = self.get_input_offset() + processed_offset;
+        let c = self.buffer[input_offset as usize];
+        self.push_bits(8, c, oi);
+    }
+
+    #[inline]
+    fn save_backlog(&mut self) {
+        let input_buf_sz = self.get_input_buffer_size();
+
+        let msi = self.match_scan_index;
+
+        let rem = input_buf_sz - msi;
+        let shift_sz = input_buf_sz + rem;
+
+        unsafe {
+            ptr::copy_nonoverlapping(
+                self.buffer
+                    .as_ptr()
+                    .add(input_buf_sz as usize - rem as usize),
+                self.buffer.as_mut_ptr(),
+                shift_sz as usize,
+            );
+        }
+
+        self.match_scan_index = 0;
+        self.input_size -= input_buf_sz - rem;
+    }
+
+    ///
+    /// Get the number of bits describing the window size,
+    /// where 2^n is the size of the current window and previous window.
+    ///
+    #[inline]
+    fn get_window_bits(&self) -> u8 {
+        self.window_sz2
+    }
+
+    ///
+    /// Get the number of bits describing the lookahead size,
+    /// where 2^n is the size of the lookahead buffer.
+    ///
+    #[inline]
+    fn get_lookahead_bits(&self) -> u8 {
+        self.lookahead_sz2
+    }
+}
+
+const FLAG_IS_FINISHING: u8 = 0x01;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanity() {
+        let mut encoder = HeatshrinkEncoder::new(8, 4).expect("Failed to create encoder");
+        let input_data: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let sink_res = encoder.sink(&input_data);
+        println!("Sink result: {:?}", sink_res);
+
+        let mut output_buffer: Vec<u8> = vec![0; 32];
+        let mut written = 0;
+        let poll_res = encoder.poll(&mut output_buffer);
+        println!("Poll result: {:?}", poll_res);
+        match poll_res {
+            HSEPollRes::Empty(sz) | HSEPollRes::More(sz) => {
+                written += sz;
+            }
+            _ => {}
+        }
+
+        let mut finish_res = encoder.finish();
+        println!("Finish result: {:?}", finish_res);
+        while finish_res == HSEFinishRes::More {
+            let poll_res = encoder.poll(&mut output_buffer);
+            println!("Poll result: {:?}", poll_res);
+            match poll_res {
+                HSEPollRes::Empty(sz) | HSEPollRes::More(sz) => {
+                    written += sz;
+                }
+                _ => {}
+            }
+
+            finish_res = encoder.finish();
+            println!("Finish result: {:?}", finish_res);
+        }
+
+        println!(
+            "Wrote {} bytes: {:2X?}",
+            written,
+            output_buffer[..written].to_vec()
+        );
+    }
+
+    // #[test]
+    // fn identical_output() {
+    //     // Load the raw bytes at tsz-compressed-data.bin, Compress and byte compare tsz-compressed-data.bin.hs
+    //     let test_data = include_bytes!("../tsz-compressed-data.bin");
+    //     // let test_data = include_bytes!("../test.txt");
+    //     let mut encoder = HeatshrinkEncoder::new(8, 7).expect("Failed to create encoder");
+    //     // println!("Compressing {:02X?}", test_data.as_slice());
+
+    //     // Sink the test data 256 bytes at a time
+    //     let mut written = 0;
+    //     let mut output_buffer = [0; 256];
+    //     let mut compressed: Vec<u8> = vec![];
+    //     while written < test_data.len() {
+    //         let num_bytes = min(256, test_data.len() - written);
+    //         let sink_res = encoder.sink(&test_data[written..written + num_bytes]);
+    //         println!(
+    //             "Sink result: {:?} {} of {}",
+    //             sink_res,
+    //             written,
+    //             test_data.len()
+    //         );
+    //         match sink_res {
+    //             HSESinkRes::Ok(sz) => {
+    //                 written += sz;
+    //             }
+    //             _ => {}
+    //         }
+
+    //         loop {
+    //             let poll_res = encoder.poll(&mut output_buffer);
+    //             println!("Poll result: {:?}", poll_res);
+    //             match poll_res {
+    //                 HSEPollRes::More(sz) => {
+    //                     compressed.extend(&output_buffer[..sz]);
+    //                 }
+    //                 HSEPollRes::Empty(sz) => {
+    //                     compressed.extend(&output_buffer[..sz]);
+    //                     break;
+    //                 }
+    //                 e => {
+    //                     println!("Unexpected poll result: {:?}", e);
+    //                     break;
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     let mut finish_res = encoder.finish();
+    //     println!("Finish result: {:?}", finish_res);
+    //     while finish_res == HSEFinishRes::More {
+    //         let poll_res = encoder.poll(&mut output_buffer);
+    //         println!("Poll result: {:?}", poll_res);
+    //         match poll_res {
+    //             HSEPollRes::Empty(sz) | HSEPollRes::More(sz) => {
+    //                 written += sz;
+    //                 compressed.extend(&output_buffer[..sz]);
+    //             }
+    //             _ => {}
+    //         }
+
+    //         finish_res = encoder.finish();
+    //         println!("Finish result: {:?}", finish_res);
+    //     }
+
+    //     println!("Wrote {} bytes", compressed.len());
+
+    //     // Compare the compressed data with the expected data
+    //     let precompressed = include_bytes!("../tsz-compressed-data.bin.hs");
+    //     // let precompressed = include_bytes!("../test.txt.hs");
+    //     // println!(
+    //     //     "Compressed {} bytes: {:02X?}",
+    //     //     compressed.len(),
+    //     //     compressed.as_slice()
+    //     // );
+    //     // println!(
+    //     //     "Expected {} bytes: {:02X?}",
+    //     //     precompressed.len(),
+    //     //     precompressed.as_slice()
+    //     // );
+
+    //     println!(
+    //         "Compressed {} bytes, expected {} bytes",
+    //         compressed.len(),
+    //         precompressed.len()
+    //     );
+    //     for i in 0..compressed.len() {
+    //         assert_eq!(
+    //             compressed[i],
+    //             precompressed[i],
+    //             "Mismatch at index {} of {}",
+    //             i,
+    //             compressed.len()
+    //         );
+    //     }
+    //     assert_eq!(
+    //         compressed.len(),
+    //         precompressed.len(),
+    //         "Compressed {} bytes into {}, but expected {}",
+    //         test_data.len(),
+    //         compressed.len(),
+    //         precompressed.len()
+    //     );
+    // }
+}
