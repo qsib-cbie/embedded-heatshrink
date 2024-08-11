@@ -1,4 +1,4 @@
 /target
 sanity_param_sweep.txt
 venv
-fuzz
+fuzz-data

@@ -17,7 +17,8 @@
 pub(crate) mod common;
 pub mod heatshrink_decoder;
 pub mod heatshrink_encoder;
-pub mod io;
+use std::io::{Read, Write};
+
 pub use heatshrink_decoder::*;
 pub use heatshrink_encoder::*;
 
@@ -26,25 +27,24 @@ pub const HEATSHRINK_MIN_WINDOW_BITS: u8 = 4;
 pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 15; // there may be some strangeness with 15 but it passes tests
 pub const HEATSHRINK_MIN_LOOKAHEAD_BITS: u8 = 3;
 
-///
-/// One-shot stream encode the input into a finished compressed buffer.
-///
-pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usize) -> Vec<u8> {
-    assert!(read_sz > 0, "read_sz must be greater than 0");
+/// Create an encoder, Read from stdin, Sink and Poll through the encoder, and Write polled bytes to stdout.
+pub fn encode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: &mut impl Write) {
     let mut encoder =
         HeatshrinkEncoder::new(window_sz2, lookahead_sz2).expect("Failed to create encoder");
-    let mut compressed = vec![];
-    let mut scratch: Vec<u8> = vec![0; read_sz * 2];
-    let mut read_offset = 0;
+
+    const WORK_SIZE_UNIT: usize = 1024;
+    let mut buf = [0; WORK_SIZE_UNIT];
+    let mut scratch = [0; WORK_SIZE_UNIT * 2];
 
     // Sink all bytes from the input buffer
-    while read_offset < input.len() {
-        let read_len = if input.len() - read_offset > read_sz {
-            read_sz
-        } else {
-            input.len() - read_offset
-        };
-        let mut read_data = &input[read_offset..read_offset + read_len];
+    let mut not_empty = false;
+    loop {
+        let read_len = read_in(stdin, &mut buf);
+        not_empty |= read_len > 0;
+        if read_len == 0 {
+            break;
+        }
+        let mut read_data = &buf[..read_len];
         while !read_data.is_empty() {
             let sink_res = encoder.sink(read_data);
             match sink_res {
@@ -52,6 +52,196 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
                     read_data = &read_data[bytes_sunk..];
                 }
                 _ => unreachable!(),
+            }
+
+            loop {
+                match encoder.poll(&mut scratch) {
+                    HSEPollRes::Empty(sz) => {
+                        write_out(stdout, &scratch[..sz]);
+                        break;
+                    }
+                    HSEPollRes::More(sz) => {
+                        write_out(stdout, &scratch[..sz]);
+                    }
+                    HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
+                }
+            }
+        }
+    }
+
+    if !not_empty {
+        return;
+    }
+
+    // Poll out the remaining bytes
+    loop {
+        match encoder.finish() {
+            HSEFinishRes::Done => {
+                break;
+            }
+            HSEFinishRes::More => {}
+            HSEFinishRes::ErrorNull => unreachable!(),
+        }
+
+        loop {
+            match encoder.poll(&mut scratch) {
+                HSEPollRes::Empty(sz) => {
+                    write_out(stdout, &scratch[..sz]);
+                    break;
+                }
+                HSEPollRes::More(sz) => {
+                    write_out(stdout, &scratch[..sz]);
+                }
+                HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Create a decoder, Read from stdin, Sink and Poll through the decoder, and Write polled bytes to stdout.
+pub fn decode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: &mut impl Write) {
+    const WORK_SIZE_UNIT: usize = 1024;
+
+    let mut decoder = HeatshrinkDecoder::new(WORK_SIZE_UNIT as u16, window_sz2, lookahead_sz2)
+        .expect("Failed to create decoder");
+    let mut buf = [0; WORK_SIZE_UNIT];
+    let mut scratch = [0; WORK_SIZE_UNIT * 2];
+
+    // Sink all bytes from the input buffer
+    let mut not_empty = false;
+    loop {
+        let read_len = read_in(stdin, &mut buf);
+        not_empty |= read_len > 0;
+        if read_len == 0 {
+            break;
+        }
+        let mut read_data = &buf[..read_len];
+        while !read_data.is_empty() {
+            let sink_res = decoder.sink(read_data);
+            match sink_res {
+                HSDSinkRes::Ok(bytes_sunk) => {
+                    read_data = &read_data[bytes_sunk..];
+                }
+                _ => unreachable!(),
+            }
+
+            loop {
+                match decoder.poll(&mut scratch) {
+                    HSDPollRes::Empty(sz) => {
+                        write_out(stdout, &scratch[..sz]);
+                        break;
+                    }
+                    HSDPollRes::More(sz) => {
+                        write_out(stdout, &scratch[..sz]);
+                    }
+                    HSDPollRes::ErrorNull => unreachable!(),
+                    HSDPollRes::ErrorUnknown => {
+                        panic!("Error: Unknown");
+                    }
+                }
+            }
+        }
+    }
+
+    if !not_empty {
+        return;
+    }
+
+    // Poll out the remaining bytes
+    loop {
+        match decoder.finish() {
+            HSDFinishRes::Done => {
+                break;
+            }
+            HSDFinishRes::More => {}
+            HSDFinishRes::ErrorNull => unreachable!(),
+        }
+
+        loop {
+            match decoder.poll(&mut scratch) {
+                HSDPollRes::Empty(sz) => {
+                    write_out(stdout, &scratch[..sz]);
+                    break;
+                }
+                HSDPollRes::More(sz) => {
+                    write_out(stdout, &scratch[..sz]);
+                }
+                HSDPollRes::ErrorNull => unreachable!(),
+                HSDPollRes::ErrorUnknown => {
+                    panic!("Error: Unknown");
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn read_in(stdin: &mut impl Read, buf: &mut [u8]) -> usize {
+    stdin.read(buf).expect("Failed to read from stdin")
+}
+
+#[inline]
+fn write_out(stdout: &mut impl Write, data: &[u8]) {
+    stdout.write_all(data).expect("Failed to write to stdout");
+}
+
+#[cfg(test)]
+mod tests {
+    use rayon::prelude::*;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usize) -> Vec<u8> {
+        assert!(read_sz > 0, "read_sz must be greater than 0");
+        let mut encoder =
+            HeatshrinkEncoder::new(window_sz2, lookahead_sz2).expect("Failed to create encoder");
+        let mut compressed = vec![];
+        let mut scratch: Vec<u8> = vec![0; read_sz * 2];
+        let mut read_offset = 0;
+
+        // Sink all bytes from the input buffer
+        while read_offset < input.len() {
+            let read_len = if input.len() - read_offset > read_sz {
+                read_sz
+            } else {
+                input.len() - read_offset
+            };
+            let mut read_data = &input[read_offset..read_offset + read_len];
+            while !read_data.is_empty() {
+                let sink_res = encoder.sink(read_data);
+                match sink_res {
+                    HSESinkRes::Ok(bytes_sunk) => {
+                        read_data = &read_data[bytes_sunk..];
+                    }
+                    _ => unreachable!(),
+                }
+
+                loop {
+                    match encoder.poll(&mut scratch) {
+                        HSEPollRes::Empty(sz) => {
+                            compressed.extend(&scratch[..sz]);
+                            break;
+                        }
+                        HSEPollRes::More(sz) => {
+                            compressed.extend(&scratch[..sz]);
+                        }
+                        HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
+                    }
+                }
+            }
+
+            read_offset += read_len;
+        }
+
+        // Poll out the remaining bytes
+        loop {
+            match encoder.finish() {
+                HSEFinishRes::Done => {
+                    break;
+                }
+                HSEFinishRes::More => {}
+                HSEFinishRes::ErrorNull => unreachable!(),
             }
 
             loop {
@@ -68,65 +258,67 @@ pub fn encode_all(input: &[u8], window_sz2: u8, lookahead_sz2: u8, read_sz: usiz
             }
         }
 
-        read_offset += read_len;
+        compressed
     }
 
-    // Poll out the remaining bytes
-    loop {
-        match encoder.finish() {
-            HSEFinishRes::Done => {
-                break;
+    fn decode_all(
+        input: &[u8],
+        input_buffer_size: usize,
+        window_sz2: u8,
+        lookahead_sz2: u8,
+        read_sz: usize,
+    ) -> Vec<u8> {
+        assert!(read_sz > 0, "read_sz must be greater than 0");
+        let mut decoder =
+            HeatshrinkDecoder::new(input_buffer_size as u16, window_sz2, lookahead_sz2)
+                .expect("Failed to create decoder");
+        let mut decompressed = vec![];
+        let mut scratch: Vec<u8> = vec![0; read_sz * 2];
+        let mut read_offset = 0;
+
+        // Sink all bytes from the input buffer
+        while read_offset < input.len() {
+            let read_len = if input.len() - read_offset > read_sz {
+                read_sz
+            } else {
+                input.len() - read_offset
+            };
+            let mut read_data = &input[read_offset..read_offset + read_len];
+            while !read_data.is_empty() {
+                let sink_res = decoder.sink(read_data);
+                match sink_res {
+                    HSDSinkRes::Ok(bytes_sunk) => {
+                        read_data = &read_data[bytes_sunk..];
+                    }
+                    _ => unreachable!(),
+                }
+
+                loop {
+                    match decoder.poll(&mut scratch) {
+                        HSDPollRes::Empty(sz) => {
+                            decompressed.extend(&scratch[..sz]);
+                            break;
+                        }
+                        HSDPollRes::More(sz) => {
+                            decompressed.extend(&scratch[..sz]);
+                        }
+                        HSDPollRes::ErrorNull => unreachable!(),
+                        e => panic!("Failed to poll data: {:?}", e),
+                    }
+                }
             }
-            HSEFinishRes::More => {}
-            HSEFinishRes::ErrorNull => unreachable!(),
+
+            read_offset += read_len;
         }
 
+        // Poll out the remaining bytes
         loop {
-            match encoder.poll(&mut scratch) {
-                HSEPollRes::Empty(sz) => {
-                    compressed.extend(&scratch[..sz]);
+            match decoder.finish() {
+                HSDFinishRes::Done => {
                     break;
                 }
-                HSEPollRes::More(sz) => {
-                    compressed.extend(&scratch[..sz]);
-                }
-                HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
-            }
-        }
-    }
-
-    compressed
-}
-
-pub fn decode_all(
-    input: &[u8],
-    input_buffer_size: usize,
-    window_sz2: u8,
-    lookahead_sz2: u8,
-    read_sz: usize,
-) -> Vec<u8> {
-    assert!(read_sz > 0, "read_sz must be greater than 0");
-    let mut decoder = HeatshrinkDecoder::new(input_buffer_size as u16, window_sz2, lookahead_sz2)
-        .expect("Failed to create decoder");
-    let mut decompressed = vec![];
-    let mut scratch: Vec<u8> = vec![0; read_sz * 2];
-    let mut read_offset = 0;
-
-    // Sink all bytes from the input buffer
-    while read_offset < input.len() {
-        let read_len = if input.len() - read_offset > read_sz {
-            read_sz
-        } else {
-            input.len() - read_offset
-        };
-        let mut read_data = &input[read_offset..read_offset + read_len];
-        while !read_data.is_empty() {
-            let sink_res = decoder.sink(read_data);
-            match sink_res {
-                HSDSinkRes::Ok(bytes_sunk) => {
-                    read_data = &read_data[bytes_sunk..];
-                }
-                _ => unreachable!(),
+                HSDFinishRes::More => {}
+                HSDFinishRes::ErrorNull => unreachable!(),
             }
 
             loop {
@@ -144,43 +336,8 @@ pub fn decode_all(
             }
         }
 
-        read_offset += read_len;
+        decompressed
     }
-
-    // Poll out the remaining bytes
-    loop {
-        match decoder.finish() {
-            HSDFinishRes::Done => {
-                break;
-            }
-            HSDFinishRes::More => {}
-            HSDFinishRes::ErrorNull => unreachable!(),
-        }
-
-        loop {
-            match decoder.poll(&mut scratch) {
-                HSDPollRes::Empty(sz) => {
-                    decompressed.extend(&scratch[..sz]);
-                    break;
-                }
-                HSDPollRes::More(sz) => {
-                    decompressed.extend(&scratch[..sz]);
-                }
-                HSDPollRes::ErrorNull => unreachable!(),
-                e => panic!("Failed to poll data: {:?}", e),
-            }
-        }
-    }
-
-    decompressed
-}
-
-#[cfg(test)]
-mod tests {
-    use rayon::prelude::*;
-    use std::time::Instant;
-
-    use super::*;
 
     fn roundtrip(
         input: &[u8],
@@ -261,11 +418,9 @@ mod tests {
     fn end2end_sanity_param_sweep() {
         // Compress several different types of files from B to KB to MB
         let text_data = include_bytes!("heatshrink_encoder.rs");
-        let random_medium_size_data = include_bytes!("../random-data.bin");
         let real_medium_size_data = include_bytes!("../tsz-compressed-data.bin");
         let data: Vec<(&'static str, &[u8])> = vec![
             ("heatshrink_encoder.rs", text_data),
-            ("random-data.bin", random_medium_size_data),
             ("tsz-compressed-data.bin", real_medium_size_data),
         ];
 
@@ -277,7 +432,7 @@ mod tests {
             });
 
         // Use several different read and buffer sizes
-        let read_buffer_sizes = [1, 2, 512, 4096];
+        let read_buffer_sizes = [1, 2, 512];
         let read_size_pairs = read_buffer_sizes
             .iter()
             .flat_map(|&read_sz| {

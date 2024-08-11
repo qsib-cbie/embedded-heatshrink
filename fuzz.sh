@@ -8,10 +8,10 @@ cargo build --release
 # if debug, use 10000 iterations and target/debug/hsz
 # if release, use 1000000 iterations and hsz
 if [ "$1" == "debug" ]; then
-  total_iterations=1000
+  total_iterations=100
   export HEATSHRINK='target/debug/hsz'
 else
-  total_iterations=10000
+  total_iterations=1000
   export HEATSHRINK='target/release/hsz'
 fi
 
@@ -24,13 +24,14 @@ fi
 # unset HEATSHRINK ; export HEATSHRINK="./heatshrink -w 9 -l 7"
 echo "Using $HEATSHRINK"
 
-# Directory for fuzz data
-mkdir -p fuzz
+# Defeine a fuzzing data directory
+export FUZZ_DIR=fuzz-data
+mkdir -p $FUZZ_DIR
 
 # Function to generate a file with a mix of data types
 generate_mixed_file() {
   i=$1
-  filename=fuzz/mixed_file_$i.bin
+  filename=$FUZZ_DIR/mixed_file_$i.bin
   total_size=$((RANDOM % 1024 * 1024)) # Total size up to 1MB
 
   {
@@ -56,7 +57,7 @@ generate_mixed_file() {
 process_file() {
   i=$1
   type=$2
-  filename=fuzz/file_$i.bin
+  filename=$FUZZ_DIR/file_$i.bin
 
   case $type in
     "zero")

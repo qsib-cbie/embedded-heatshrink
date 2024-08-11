@@ -15,16 +15,6 @@ pub(crate) struct OutputInfo<'a> {
 #[cold]
 fn cold() {}
 
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn likely(b: bool) -> bool {
-    if !b {
-        cold()
-    }
-    b
-}
-
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn unlikely(b: bool) -> bool {
     if b {

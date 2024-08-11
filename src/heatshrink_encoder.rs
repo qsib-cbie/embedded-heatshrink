@@ -572,10 +572,6 @@ impl HeatshrinkEncoder {
                 // Shift bits to the correct position and adjust the bit index
                 self.current_byte |= bits_to_insert << (8 - bits_left);
                 self.bit_index >>= bits_left;
-
-                if self.bit_index == 0 {
-                    self.write_current_byte(oi);
-                }
             }
         }
     }
