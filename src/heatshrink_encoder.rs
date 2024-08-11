@@ -286,7 +286,8 @@ impl HeatshrinkEncoder {
         let msi = self.match_scan_index;
 
         let fin = self.is_finishing();
-        if msi > self.input_size - (if fin { 1 } else { lookahead_sz }) {
+        let offset = if unlikely(fin) { 1 } else { lookahead_sz };
+        if msi > self.input_size.saturating_sub(offset) {
             return if fin {
                 HSEState::FlushBits
             } else {
@@ -515,21 +516,168 @@ impl HeatshrinkEncoder {
     fn push_bits(&mut self, count: u8, bits: u8, oi: &mut OutputInfo) {
         debug_assert!(count <= 8);
 
+        enum EmitCase {
+            Case8,
+            Case7,
+            Case6,
+            Case5,
+            Case4,
+            Case3,
+            Case2,
+            Case1,
+            General,
+        }
+
+        let emit_case = match count {
+            8 => EmitCase::Case8,
+            7 => EmitCase::Case7,
+            6 => EmitCase::Case6,
+            5 => EmitCase::Case5,
+            4 => EmitCase::Case4,
+            3 => EmitCase::Case3,
+            2 => EmitCase::Case2,
+            1 => EmitCase::Case1,
+            _ => EmitCase::General,
+        };
+
         if count == 8 && self.bit_index == 0x80 {
             oi.buf[*oi.output_size] = bits;
             *oi.output_size += 1;
         } else {
-            for i in (0..count).rev() {
-                let bit = bits & (1 << i) != 0;
-                if bit {
-                    self.current_byte |= self.bit_index;
+            // Specialized, unrolled versions for the only possible cases
+            match emit_case {
+                EmitCase::Case8 => {
+                    for i in (0..8).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
                 }
-                self.bit_index >>= 1;
-                if self.bit_index == 0x00 {
-                    self.bit_index = 0x80;
-                    oi.buf[*oi.output_size] = self.current_byte;
-                    *oi.output_size += 1;
-                    self.current_byte = 0x00;
+                EmitCase::Case7 => {
+                    for i in (0..7).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case6 => {
+                    for i in (0..6).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case5 => {
+                    for i in (0..5).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case4 => {
+                    for i in (0..4).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case3 => {
+                    for i in (0..3).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case2 => {
+                    for i in (0..2).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
+                }
+                EmitCase::Case1 => {
+                    let bit = bits & 1 != 0;
+                    if bit {
+                        self.current_byte |= self.bit_index;
+                    }
+                    self.bit_index >>= 1;
+                    if self.bit_index == 0x00 {
+                        self.bit_index = 0x80;
+                        oi.buf[*oi.output_size] = self.current_byte;
+                        *oi.output_size += 1;
+                        self.current_byte = 0x00;
+                    }
+                }
+                EmitCase::General => {
+                    for i in (0..count).rev() {
+                        let bit = bits & (1 << i) != 0;
+                        if bit {
+                            self.current_byte |= self.bit_index;
+                        }
+                        self.bit_index >>= 1;
+                        if self.bit_index == 0x00 {
+                            self.bit_index = 0x80;
+                            oi.buf[*oi.output_size] = self.current_byte;
+                            *oi.output_size += 1;
+                            self.current_byte = 0x00;
+                        }
+                    }
                 }
             }
         }

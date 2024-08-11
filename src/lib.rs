@@ -23,7 +23,7 @@ pub use heatshrink_encoder::*;
 
 /// Heatshrink constant limits
 pub const HEATSHRINK_MIN_WINDOW_BITS: u8 = 4;
-pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 15; // there may be some strangeness with 15
+pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 15; // there may be some strangeness with 15 but it passes tests
 pub const HEATSHRINK_MIN_LOOKAHEAD_BITS: u8 = 3;
 
 ///
@@ -371,13 +371,13 @@ mod tests {
                 .partial_cmp(&b.compression_ratio)
                 .unwrap()
         });
-        println!("Bottom 3 compression ratios:");
-        for i in 0..3 {
-            println!("{:?}", results[i]);
+        println!("Bottom compression ratios:");
+        for i in 0..50 {
+            println!("WORST RATIO: {:?}", results[i]);
         }
-        println!("Top 3 compression ratios:");
-        for i in (results.len() - 3)..results.len() {
-            println!("{:?}", results[i]);
+        println!("Top compression ratios:");
+        for i in (results.len() - 50)..results.len() {
+            println!("BEST RATIO: {:?}", results[i]);
         }
 
         // Print top 3 and bottom 3 compression times
@@ -386,13 +386,13 @@ mod tests {
                 .partial_cmp(&b.compression_time_us)
                 .unwrap()
         });
-        println!("Top 3 compression times:");
-        for i in 0..3 {
-            println!("{:?}", results[i]);
-        }
         println!("Bottom 3 compression times:");
-        for i in (results.len() - 3)..results.len() {
-            println!("{:?}", results[i]);
+        for i in (results.len() - 50)..results.len() {
+            println!("WORST TIME: {:?}", results[i]);
+        }
+        println!("Top compression times:");
+        for i in 0..50 {
+            println!("BEST TIME: {:?}", results[i]);
         }
 
         let t1 = Instant::now();

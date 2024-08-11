@@ -10,3 +10,25 @@ pub(crate) struct OutputInfo<'a> {
     /// bytes pushed to the buffer, so far
     pub output_size: &'a mut usize,
 }
+
+#[inline]
+#[cold]
+fn cold() {}
+
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn likely(b: bool) -> bool {
+    if !b {
+        cold()
+    }
+    b
+}
+
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn unlikely(b: bool) -> bool {
+    if b {
+        cold()
+    }
+    b
+}
