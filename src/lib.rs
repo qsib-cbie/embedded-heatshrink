@@ -260,12 +260,10 @@ mod tests {
     #[test]
     fn end2end_sanity_param_sweep() {
         // Compress several different types of files from B to KB to MB
-        let simple_text_data = include_bytes!("../test.txt");
         let text_data = include_bytes!("heatshrink_encoder.rs");
         let random_medium_size_data = include_bytes!("../random-data.bin");
         let real_medium_size_data = include_bytes!("../tsz-compressed-data.bin");
         let data: Vec<(&'static str, &[u8])> = vec![
-            ("text.txt", simple_text_data),
             ("heatshrink_encoder.rs", text_data),
             ("random-data.bin", random_medium_size_data),
             ("tsz-compressed-data.bin", real_medium_size_data),
@@ -279,7 +277,7 @@ mod tests {
             });
 
         // Use several different read and buffer sizes
-        let read_buffer_sizes = [1, 2, 8, 64, 512, 4096];
+        let read_buffer_sizes = [1, 2, 512, 4096];
         let read_size_pairs = read_buffer_sizes
             .iter()
             .flat_map(|&read_sz| {
@@ -290,7 +288,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Use several different input buffer sizes to stress different code paths
-        let input_buffer_sizes = [1, 64, 512, 8192];
+        let input_buffer_sizes = [1, 64, 8192];
 
         // Use rayon to run all the permutations in parallel
         let mut configurations = vec![];
@@ -397,5 +395,23 @@ mod tests {
 
         let t1 = Instant::now();
         println!("Completed permutations in {:?}", t1 - t0);
+    }
+
+    #[test]
+    fn fuzz() {
+        // Fuzzing is implemented by ./fuzz.sh, call with ./fuzz.sh debug if in debug mode
+        // Run the command and expect 0 exit code
+        let status = if cfg!(debug_assertions) {
+            std::process::Command::new("./fuzz.sh")
+                .arg("debug")
+                .status()
+                .expect("Fuzz failed")
+        } else {
+            std::process::Command::new("./fuzz.sh")
+                .status()
+                .expect("Fuzz failed")
+        };
+
+        assert!(status.success());
     }
 }

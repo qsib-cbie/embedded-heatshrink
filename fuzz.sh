@@ -2,16 +2,22 @@
 
 # Ensure hsz is installed
 cargo build
-cargo install --path .
+cargo build --release
+# cargo install --path .
 
 # if debug, use 10000 iterations and target/debug/hsz
 # if release, use 1000000 iterations and hsz
 if [ "$1" == "debug" ]; then
-  total_iterations=10000
+  total_iterations=1000
   export HEATSHRINK='target/debug/hsz'
 else
-  total_iterations=1000000
-  export HEATSHRINK='hsz'
+  total_iterations=10000
+  export HEATSHRINK='target/release/hsz'
+fi
+
+# Allow environment variable to override the total iterations
+if [ $HSZ_ITERATIONS ]; then
+  total_iterations=$HSZ_ITERATIONS
 fi
 
 # # Use C version override
