@@ -450,15 +450,7 @@ impl HeatshrinkEncoder {
         let break_even_point =
             ((1 + self.get_window_bits() + self.get_lookahead_bits()) / 8) as usize;
         let start = start as i16;
-        while pos >= start && pos >= 0 {
-            if pos < 0 {
-                // Write to stderr
-                eprintln!(
-                    "window_sz2: {}, lookahead_sz2: {}, start: {}, end: {}, maxlen: {}, pos: {} start: {}",
-                    self.window_sz2, self.lookahead_sz2,
-                    start, end, maxlen, pos, start
-                );
-            }
+        while pos >= start {
             let posidx = pos as usize;
             let pospoint = &buf[posidx..];
 
