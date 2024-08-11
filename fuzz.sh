@@ -3,6 +3,11 @@
 # Ensure hsz is installed
 cargo install --path .
 
+# Use C or Rust version
+export HEATSHRINK=hsz
+# export HEATSHRINK="./heatshrink -w 9 -l 7"
+echo "Using $HEATSHRINK"
+
 # Total number of iterations
 total_iterations=100000
 
@@ -48,7 +53,7 @@ process_file() {
       dd if=/dev/urandom of="$filename" bs=1k count=$((RANDOM % 10000)) 2> /dev/null
       ;;
     "text")
-      LC_ALL=C tr -dc 'a-zA-Z0-9 \n' < /dev/urandom | head -c $((RANDOM % 10000 * 1024)) > "$filename"
+      LC_ALL=C tr -dc 'a-zA-Z0-9 \n' < /dev/urandom | head -c $(((RANDOM % 10000 * 1024) + 1)) > "$filename"
       ;;
     "mixed")
       generate_mixed_file "$i"
@@ -56,8 +61,8 @@ process_file() {
 
   esac
 
-  hsz < "$filename" > "$filename.hsz"
-  hsz -d < "$filename.hsz" > "$filename.decompressed"
+  $HEATSHRINK < "$filename" > "$filename.hsz"
+  $HEATSHRINK -d < "$filename.hsz" > "$filename.decompressed"
   diff "$filename" "$filename.decompressed"
 
   # Delete files if diff is empty, else exit

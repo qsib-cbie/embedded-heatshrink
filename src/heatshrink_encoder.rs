@@ -285,14 +285,12 @@ impl HeatshrinkEncoder {
         let lookahead_sz = self.lookahead_size;
         let msi = self.match_scan_index;
 
-        let fin = self.is_finishing();
-        let offset = if unlikely(fin) { 1 } else { lookahead_sz };
-        if msi > self.input_size.saturating_sub(offset) {
-            return if fin {
-                HSEState::FlushBits
-            } else {
-                HSEState::SaveBacklog
-            };
+        if msi > self.input_size.saturating_sub(lookahead_sz) {
+            return HSEState::SaveBacklog;
+        } else if unlikely(self.is_finishing()) {
+            if self.input_size == 0 || msi > self.input_size.saturating_sub(1) {
+                return HSEState::FlushBits;
+            }
         }
 
         let input_offset = self.get_input_offset();
@@ -407,18 +405,20 @@ impl HeatshrinkEncoder {
 
     #[inline]
     fn do_indexing(&mut self) {
-        const FILL: i16 = -1;
-        let mut last: [i16; 256] = [FILL; 256];
-
         let data = &self.buffer;
         let input_offset = self.get_input_offset();
         let index = &mut self.search_index;
         let end = input_offset + self.input_size;
-        for i in 0..end {
-            let v = data[i] as usize;
-            index[i] = last[v];
-            last[v] = i as i16;
-        }
+        let mut last: [i16; 256] = [-1; 256];
+        data.iter()
+            .take(end)
+            .zip(index.iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, j))| {
+                let v = *v as usize;
+                *j = last[v];
+                last[v] = i as i16;
+            });
     }
 
     #[inline]

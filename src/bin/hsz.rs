@@ -5,13 +5,14 @@
 ///!
 ///! If the `-d` flag is passed, stdin is buffered, sunk through a `HeatshrinkDecoder`, and then written to stdout.
 ///!
-use std::io::{self, Read, StdinLock, StdoutLock, Write};
+use std::io::{self, Read, Write};
 use std::process;
 
 use tsz_heatshrink::*;
 
-const DEFAULT_WINDOW_BITS: u8 = 8;
-const DEFAULT_LOOKAHEAD_BITS: u8 = 4;
+// chosen based on bar chart in 'average-compression-tsz-data.png'
+const DEFAULT_WINDOW_BITS: u8 = 9;
+const DEFAULT_LOOKAHEAD_BITS: u8 = 7;
 const WORK_SIZE_UNIT: usize = 1024;
 
 fn main() {
@@ -21,39 +22,41 @@ fn main() {
         process::exit(1);
     }
 
-    let decompress = args.len() == 2 && args[1] == "-d";
-    if decompress {
-        decode();
-    } else {
-        encode();
-    }
-}
-
-#[inline]
-fn read_in(stdin: &mut StdinLock<'_>, buf: &mut [u8]) -> usize {
-    stdin.read(buf).expect("Failed to read from stdin")
-}
-
-#[inline]
-fn write_out(stdout: &mut StdoutLock<'_>, data: &[u8]) {
-    stdout.write_all(data).expect("Failed to write to stdout");
-}
-
-/// Create an encoder, Read from stdin, Sink and Poll through the encoder, and Write polled bytes to stdout.
-fn encode() {
-    let mut encoder = HeatshrinkEncoder::new(DEFAULT_WINDOW_BITS, DEFAULT_LOOKAHEAD_BITS)
-        .expect("Failed to create encoder");
+    // Use stdin and stdout for I/O
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
+
+    let decompress = args.len() == 2 && args[1] == "-d";
+    if decompress {
+        decode(&mut stdin, &mut stdout);
+    } else {
+        encode(&mut stdin, &mut stdout);
+    }
+}
+
+#[inline]
+fn read_in(stdin: &mut impl Read, buf: &mut [u8]) -> usize {
+    stdin.read(buf).expect("Failed to read from stdin")
+}
+
+#[inline]
+fn write_out(stdout: &mut impl Write, data: &[u8]) {
+    stdout.write_all(data).expect("Failed to write to stdout");
+}
+
+/// Create an encoder, Read from stdin, Sink and Poll through the encoder, and Write polled bytes to stdout.
+fn encode(stdin: &mut impl Read, stdout: &mut impl Write) {
+    let mut encoder = HeatshrinkEncoder::new(DEFAULT_WINDOW_BITS, DEFAULT_LOOKAHEAD_BITS)
+        .expect("Failed to create encoder");
     let mut buf = [0; WORK_SIZE_UNIT];
     let mut scratch = [0; WORK_SIZE_UNIT * 2];
 
     // Sink all bytes from the input buffer
     let mut not_empty = false;
     loop {
-        let read_len = read_in(&mut stdin, &mut buf);
+        let read_len = read_in(stdin, &mut buf);
         not_empty |= read_len > 0;
         if read_len == 0 {
             break;
@@ -71,11 +74,11 @@ fn encode() {
             loop {
                 match encoder.poll(&mut scratch) {
                     HSEPollRes::Empty(sz) => {
-                        write_out(&mut stdout, &scratch[..sz]);
+                        write_out(stdout, &scratch[..sz]);
                         break;
                     }
                     HSEPollRes::More(sz) => {
-                        write_out(&mut stdout, &scratch[..sz]);
+                        write_out(stdout, &scratch[..sz]);
                     }
                     HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
                 }
@@ -100,11 +103,11 @@ fn encode() {
         loop {
             match encoder.poll(&mut scratch) {
                 HSEPollRes::Empty(sz) => {
-                    write_out(&mut stdout, &scratch[..sz]);
+                    write_out(stdout, &scratch[..sz]);
                     break;
                 }
                 HSEPollRes::More(sz) => {
-                    write_out(&mut stdout, &scratch[..sz]);
+                    write_out(stdout, &scratch[..sz]);
                 }
                 HSEPollRes::ErrorMisuse | HSEPollRes::ErrorNull => unreachable!(),
             }
@@ -113,24 +116,20 @@ fn encode() {
 }
 
 /// Create a decoder, Read from stdin, Sink and Poll through the decoder, and Write polled bytes to stdout.
-fn decode() {
+fn decode(stdin: &mut impl Read, stdout: &mut impl Write) {
     let mut decoder = HeatshrinkDecoder::new(
         WORK_SIZE_UNIT as u16,
         DEFAULT_WINDOW_BITS,
         DEFAULT_LOOKAHEAD_BITS,
     )
     .expect("Failed to create decoder");
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
     let mut buf = [0; WORK_SIZE_UNIT];
     let mut scratch = [0; WORK_SIZE_UNIT * 2];
 
     // Sink all bytes from the input buffer
     let mut not_empty = false;
     loop {
-        let read_len = read_in(&mut stdin, &mut buf);
+        let read_len = read_in(stdin, &mut buf);
         not_empty |= read_len > 0;
         if read_len == 0 {
             break;
@@ -148,11 +147,11 @@ fn decode() {
             loop {
                 match decoder.poll(&mut scratch) {
                     HSDPollRes::Empty(sz) => {
-                        write_out(&mut stdout, &scratch[..sz]);
+                        write_out(stdout, &scratch[..sz]);
                         break;
                     }
                     HSDPollRes::More(sz) => {
-                        write_out(&mut stdout, &scratch[..sz]);
+                        write_out(stdout, &scratch[..sz]);
                     }
                     HSDPollRes::ErrorNull => unreachable!(),
                     HSDPollRes::ErrorUnknown => {
@@ -181,11 +180,11 @@ fn decode() {
         loop {
             match decoder.poll(&mut scratch) {
                 HSDPollRes::Empty(sz) => {
-                    write_out(&mut stdout, &scratch[..sz]);
+                    write_out(stdout, &scratch[..sz]);
                     break;
                 }
                 HSDPollRes::More(sz) => {
-                    write_out(&mut stdout, &scratch[..sz]);
+                    write_out(stdout, &scratch[..sz]);
                 }
                 HSDPollRes::ErrorNull => unreachable!(),
                 HSDPollRes::ErrorUnknown => {
@@ -193,6 +192,25 @@ fn decode() {
                     process::exit(-1);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_pass_fuzz_fail_0() {
+        for i in 0..=1024 {
+            let zeros = vec![0u8; i];
+            let mut compressed = vec![];
+            encode(&mut zeros.as_slice(), &mut compressed);
+
+            let mut decompressed = vec![];
+            decode(&mut compressed.as_slice(), &mut decompressed);
+
+            assert_eq!(zeros, decompressed, "Failed at i = {}", i);
         }
     }
 }
