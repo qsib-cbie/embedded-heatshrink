@@ -9,6 +9,31 @@ total_iterations=100000
 # Directory for fuzz data
 mkdir -p fuzz
 
+# Function to generate a file with a mix of data types
+generate_mixed_file() {
+  i=$1
+  filename=fuzz/mixed_file_$i.bin
+  total_size=$((RANDOM % 1024 * 1024)) # Total size up to 1MB
+
+  {
+    while [ $total_size -gt 0 ]; do
+      chunk_size=$((RANDOM % 1024 + 1)) # Random chunk size between 1 and 1024 bytes
+      case $((RANDOM % 3)) in
+        0) # Zero data
+          dd if=/dev/zero bs=1 count=$chunk_size 2>/dev/null
+          ;;
+        1) # Random data
+          dd if=/dev/urandom bs=1 count=$chunk_size 2>/dev/null
+          ;;
+        2) # Text-like data
+          LC_ALL=C tr -dc 'a-zA-Z0-9 \n' < /dev/urandom | head -c $chunk_size
+          ;;
+      esac
+      total_size=$((total_size - chunk_size))
+    done
+  } > "$filename"
+}
+
 # Function to process a file
 process_file() {
   i=$1
@@ -25,6 +50,10 @@ process_file() {
     "text")
       LC_ALL=C tr -dc 'a-zA-Z0-9 \n' < /dev/urandom | head -c $((RANDOM % 10000 * 1024)) > "$filename"
       ;;
+    "mixed")
+      generate_mixed_file "$i"
+      ;;
+
   esac
 
   hsz < "$filename" > "$filename.hsz"
@@ -41,29 +70,36 @@ process_file() {
 }
 
 export -f process_file
+export -f generate_mixed_file
 
-# # Run zero data tests
-# echo "Processing zero data files..."
-# seq $((total_iterations * 1 / 10)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} zero
-# if [ $? -ne 0 ]; then
-#     echo "An error occurred during zero data processing. Exiting."
-#     exit 1
-# fi
+# Run zero data tests
+echo "Processing zero data files..."
+seq $((total_iterations * 1 / 100)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} zero
+if [ $? -ne 0 ]; then
+    echo "An error occurred during zero data processing. Exiting."
+    exit 1
+fi
 
 # Run random data tests
 echo "Processing random data files..."
-seq $((total_iterations * 4 / 10)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} random
+seq $((total_iterations * 24 / 100)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} random
 if [ $? -ne 0 ]; then
     echo "An error occurred during random data processing. Exiting."
     exit 1
 fi
 
-
-# # Run text-like data tests
+# Run text-like data tests
 echo "Processing text-like data files..."
-seq $((total_iterations * 5 / 10)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} text
+seq $((total_iterations * 25 / 100)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} text
 if [ $? -ne 0 ]; then
     echo "An error occurred during text-like data processing. Exiting."
     exit 1
 fi
 
+# Run mixed data tests
+echo "Processing mixed data files..."
+seq $((total_iterations * 40 / 100)) | parallel --bar --halt now,fail=1 -j "$(nproc)" process_file {} mixed
+if [ $? -ne 0 ]; then
+    echo "An error occurred during mixed data processing. Exiting."
+    exit 1
+fi
