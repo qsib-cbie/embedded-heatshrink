@@ -2,3 +2,4 @@
 sanity_param_sweep.txt
 venv
 fuzz-data
+*.profraw
