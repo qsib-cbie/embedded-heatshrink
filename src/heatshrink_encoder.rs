@@ -214,7 +214,14 @@ impl HeatshrinkEncoder {
         let cp_sz = min(rem, in_buf.len()); // 0 if full
 
         // Copy as many bytes as possible into the input buffer
-        self.buffer[write_offset..write_offset + cp_sz].copy_from_slice(&in_buf[..cp_sz]);
+        // self.buffer[write_offset..write_offset + cp_sz].copy_from_slice(&in_buf[..cp_sz]);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                in_buf.as_ptr(),
+                self.buffer.as_mut_ptr().add(write_offset),
+                cp_sz,
+            )
+        };
         self.input_size += cp_sz;
 
         // If the input buffer is full, then caller needs to poll to progress
@@ -287,10 +294,8 @@ impl HeatshrinkEncoder {
 
         if msi > self.input_size.saturating_sub(lookahead_sz) {
             return HSEState::SaveBacklog;
-        } else if unlikely(self.is_finishing()) {
-            if self.input_size == 0 || msi > self.input_size.saturating_sub(1) {
-                return HSEState::FlushBits;
-            }
+        } else if unlikely(self.is_finishing()) && msi >= self.input_size {
+            return HSEState::FlushBits;
         }
 
         let input_offset = self.get_input_offset();
@@ -385,7 +390,8 @@ impl HeatshrinkEncoder {
         if self.bit_index == 0x80 {
             HSEState::Done
         } else if self.can_take_byte(oi) {
-            oi.buf[*oi.output_size] = self.current_byte;
+            debug_assert!(*oi.output_size < oi.buf.len());
+            unsafe { *oi.buf.get_unchecked_mut(*oi.output_size) = self.current_byte };
             *oi.output_size += 1;
             HSEState::Done
         } else {
@@ -416,7 +422,7 @@ impl HeatshrinkEncoder {
             .enumerate()
             .for_each(|(i, (v, j))| {
                 let v = *v as usize;
-                *j = last[v];
+                *j = unsafe { *last.get_unchecked(v) };
                 last[v] = i as i16;
             });
     }
@@ -431,7 +437,7 @@ impl HeatshrinkEncoder {
         *oi.output_size < oi.buf.len()
     }
 
-    #[inline]
+    #[inline(always)]
     fn find_longest_match(
         &self,
         start: usize,
@@ -450,31 +456,41 @@ impl HeatshrinkEncoder {
         let break_even_point =
             ((1 + self.get_window_bits() + self.get_lookahead_bits()) / 8) as usize;
         let start = start as i16;
-        while pos >= start {
-            let posidx = pos as usize;
-            let pospoint = &buf[posidx..];
+        unsafe {
+            // fuzz with debug assertions
+            while pos >= start {
+                let posidx = pos as usize;
+                debug_assert!(posidx < buf.len());
+                let pospoint = buf.get_unchecked(posidx..);
 
-            if pospoint[match_maxlen] != needlepoint[match_maxlen] {
-                pos = hsi[posidx];
-                continue;
-            }
-
-            let mut len = 1;
-            while len < maxlen {
-                if pospoint[len] != needlepoint[len] {
-                    break;
+                debug_assert!(pospoint.len() >= match_maxlen);
+                debug_assert!(needlepoint.len() >= match_maxlen);
+                if pospoint.get_unchecked(match_maxlen) != needlepoint.get_unchecked(match_maxlen) {
+                    pos = *hsi.get_unchecked(posidx);
+                    continue;
                 }
-                len += 1;
-            }
 
-            if len > match_maxlen {
-                match_maxlen = len;
-                match_index = pos as u16;
-                if len == maxlen {
-                    break;
+                let mut len = 1;
+                while len < maxlen {
+                    debug_assert!(pospoint.len() >= len);
+                    debug_assert!(needlepoint.len() >= len);
+                    if pospoint.get_unchecked(len) != needlepoint.get_unchecked(len) {
+                        break;
+                    }
+                    len += 1;
                 }
+
+                if len > match_maxlen {
+                    match_maxlen = len;
+                    match_index = pos as u16;
+                    if len == maxlen {
+                        break;
+                    }
+                }
+
+                debug_assert!(posidx < hsi.len());
+                pos = *hsi.get_unchecked(posidx);
             }
-            pos = hsi[posidx];
         }
 
         if match_maxlen > break_even_point {
@@ -504,173 +520,45 @@ impl HeatshrinkEncoder {
         count
     }
 
+    // Function to handle the writing logic when bit_index reaches zero
+    #[inline]
+    fn write_current_byte(&mut self, oi: &mut OutputInfo) {
+        self.bit_index = 0x80;
+        debug_assert!(*oi.output_size < oi.buf.len());
+        unsafe { *oi.buf.get_unchecked_mut(*oi.output_size) = self.current_byte };
+        *oi.output_size += 1;
+        self.current_byte = 0x00;
+    }
+
     #[inline]
     fn push_bits(&mut self, count: u8, bits: u8, oi: &mut OutputInfo) {
         debug_assert!(count <= 8);
-
-        enum EmitCase {
-            Case8,
-            Case7,
-            Case6,
-            Case5,
-            Case4,
-            Case3,
-            Case2,
-            Case1,
-            General,
-        }
-
-        let emit_case = match count {
-            8 => EmitCase::Case8,
-            7 => EmitCase::Case7,
-            6 => EmitCase::Case6,
-            5 => EmitCase::Case5,
-            4 => EmitCase::Case4,
-            3 => EmitCase::Case3,
-            2 => EmitCase::Case2,
-            1 => EmitCase::Case1,
-            _ => EmitCase::General,
-        };
-
+        // Directly emit the whole byte if possible
         if count == 8 && self.bit_index == 0x80 {
             oi.buf[*oi.output_size] = bits;
             *oi.output_size += 1;
         } else {
-            // Specialized, unrolled versions for the only possible cases
-            match emit_case {
-                EmitCase::Case8 => {
-                    for i in (0..8).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
+            let bits_to_write = bits;
+            let mut bits_left = count;
+            while bits_left > 0 {
+                let bits_this_round = self.bit_index.count_ones() as u8;
+                let mask = (1 << bits_this_round) - 1;
+
+                // Extract the necessary bits
+                let bits_to_insert = (bits_to_write >> (bits_left - bits_this_round)) & mask;
+
+                // Shift bits to align with the current bit index
+                self.current_byte |= bits_to_insert * (self.bit_index >> (bits_this_round - 1));
+
+                // Decrease bit index
+                self.bit_index >>= bits_this_round;
+
+                if self.bit_index == 0 {
+                    self.write_current_byte(oi);
                 }
-                EmitCase::Case7 => {
-                    for i in (0..7).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case6 => {
-                    for i in (0..6).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case5 => {
-                    for i in (0..5).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case4 => {
-                    for i in (0..4).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case3 => {
-                    for i in (0..3).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case2 => {
-                    for i in (0..2).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
-                EmitCase::Case1 => {
-                    let bit = bits & 1 != 0;
-                    if bit {
-                        self.current_byte |= self.bit_index;
-                    }
-                    self.bit_index >>= 1;
-                    if self.bit_index == 0x00 {
-                        self.bit_index = 0x80;
-                        oi.buf[*oi.output_size] = self.current_byte;
-                        *oi.output_size += 1;
-                        self.current_byte = 0x00;
-                    }
-                }
-                EmitCase::General => {
-                    for i in (0..count).rev() {
-                        let bit = bits & (1 << i) != 0;
-                        if bit {
-                            self.current_byte |= self.bit_index;
-                        }
-                        self.bit_index >>= 1;
-                        if self.bit_index == 0x00 {
-                            self.bit_index = 0x80;
-                            oi.buf[*oi.output_size] = self.current_byte;
-                            *oi.output_size += 1;
-                            self.current_byte = 0x00;
-                        }
-                    }
-                }
+
+                // Update the remaining bits
+                bits_left -= bits_this_round;
             }
         }
     }
@@ -679,7 +567,8 @@ impl HeatshrinkEncoder {
     fn push_literal_byte(&mut self, oi: &mut OutputInfo) {
         let processed_offset = self.match_scan_index - 1;
         let input_offset = self.get_input_offset() + processed_offset;
-        let c = self.buffer[input_offset];
+        debug_assert!(input_offset < self.buffer.len());
+        let c = unsafe { *self.buffer.get_unchecked(input_offset) };
         self.push_bits(8, c, oi);
     }
 

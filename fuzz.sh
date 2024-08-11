@@ -1,15 +1,22 @@
 #!/bin/bash
 
 # Ensure hsz is installed
+cargo build
 cargo install --path .
 
-# Use C or Rust version
-export HEATSHRINK=hsz
-# export HEATSHRINK="./heatshrink -w 9 -l 7"
-echo "Using $HEATSHRINK"
+# if debug, use 10000 iterations and target/debug/hsz
+# if release, use 1000000 iterations and hsz
+if [ "$1" == "debug" ]; then
+  total_iterations=10000
+  export HEATSHRINK='target/debug/hsz'
+else
+  total_iterations=1000000
+  export HEATSHRINK='hsz'
+fi
 
-# Total number of iterations
-total_iterations=100000
+# # Use C version override
+# unset HEATSHRINK ; export HEATSHRINK="./heatshrink -w 9 -l 7"
+echo "Using $HEATSHRINK"
 
 # Directory for fuzz data
 mkdir -p fuzz
