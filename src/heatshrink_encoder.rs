@@ -532,7 +532,7 @@ impl HeatshrinkEncoder {
 
     #[inline]
     fn push_bits(&mut self, count: u8, bits: u8, oi: &mut OutputInfo) {
-        debug_assert!(count <= 8);
+        debug_assert!(count >= 1 && count <= 8);
         // Directly emit the whole byte if possible
         if count == 8 && self.bit_index == 0x80 {
             oi.buf[*oi.output_size] = bits;
@@ -540,25 +540,42 @@ impl HeatshrinkEncoder {
         } else {
             let bits_to_write = bits;
             let mut bits_left = count;
-            while bits_left > 0 {
-                let bits_this_round = self.bit_index.count_ones() as u8;
-                let mask = (1 << bits_this_round) - 1;
 
-                // Extract the necessary bits
-                let bits_to_insert = (bits_to_write >> (bits_left - bits_this_round)) & mask;
+            // First operation: attempt to fill the remaining bits in the current byte
+            // Determine how many bits can be inserted into the current byte
+            let available_space = self.bit_index.trailing_zeros() as u8 + 1;
+            let bits_this_round = std::cmp::min(bits_left, available_space);
+            let shift_amount = bits_left - bits_this_round;
 
-                // Shift bits to align with the current bit index
-                self.current_byte |= bits_to_insert * (self.bit_index >> (bits_this_round - 1));
+            // Mask and shift to get the bits to insert into the current byte
+            let mask = (1u8 << bits_this_round) - 1;
+            let bits_to_insert = (bits_to_write >> shift_amount) & mask;
 
-                // Decrease bit index
-                self.bit_index >>= bits_this_round;
+            // Shift the bits to their correct position in the current byte
+            self.current_byte |= bits_to_insert << (available_space - bits_this_round);
+            self.bit_index >>= bits_this_round;
+
+            // Reduce the number of bits left to write
+            bits_left -= bits_this_round;
+
+            // Write current byte if it's full
+            if self.bit_index == 0 {
+                self.write_current_byte(oi);
+            }
+
+            // Second operation: handle any remaining bits
+            if bits_left > 0 {
+                // Prepare to write the remaining bits in the next byte
+                let mask = (1u8 << bits_left) - 1;
+                let bits_to_insert = bits_to_write & mask;
+
+                // Shift bits to the correct position and adjust the bit index
+                self.current_byte |= bits_to_insert << (8 - bits_left);
+                self.bit_index >>= bits_left;
 
                 if self.bit_index == 0 {
                     self.write_current_byte(oi);
                 }
-
-                // Update the remaining bits
-                bits_left -= bits_this_round;
             }
         }
     }

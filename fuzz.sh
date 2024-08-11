@@ -68,13 +68,12 @@ process_file() {
 
   esac
 
-  $HEATSHRINK < "$filename" > "$filename.hsz"
-  $HEATSHRINK -d < "$filename.hsz" > "$filename.decompressed"
+  $HEATSHRINK < "$filename" | $HEATSHRINK -d > "$filename.decompressed"
   diff "$filename" "$filename.decompressed"
 
   # Delete files if diff is empty, else exit
   if [ $? -eq 0 ]; then
-      rm "$filename" "$filename.hsz" "$filename.decompressed"
+      rm "$filename" "$filename.decompressed"
   else
       echo "Diff not empty for $filename, exiting"
       exit 1
