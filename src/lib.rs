@@ -7,17 +7,22 @@
 //! under the assumption that this library may be used in a no_std context
 //! with alloc support.
 //!
-// #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 // #![cfg(not(test))]
 // extern crate alloc;
 
-// How do I prevent the formatter from moving the comments to the top of the file?
-// I want the comments to be at the top of the file, but the formatter keeps moving them to the bottom of the file.
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
+#[cfg(feature = "std")]
+use std::io::{Read, Write};
 
 pub(crate) mod common;
 pub mod heatshrink_decoder;
 pub mod heatshrink_encoder;
-use std::io::{Read, Write};
 
 pub use heatshrink_decoder::*;
 pub use heatshrink_encoder::*;
@@ -28,6 +33,7 @@ pub const HEATSHRINK_MAX_WINDOW_BITS: u8 = 15; // there may be some strangeness 
 pub const HEATSHRINK_MIN_LOOKAHEAD_BITS: u8 = 3;
 
 /// Create an encoder, Read from stdin, Sink and Poll through the encoder, and Write polled bytes to stdout.
+#[cfg(feature = "std")]
 pub fn encode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: &mut impl Write) {
     let mut encoder =
         HeatshrinkEncoder::new(window_sz2, lookahead_sz2).expect("Failed to create encoder");
@@ -99,6 +105,7 @@ pub fn encode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: 
 }
 
 /// Create a decoder, Read from stdin, Sink and Poll through the decoder, and Write polled bytes to stdout.
+#[cfg(feature = "std")]
 pub fn decode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: &mut impl Write) {
     const WORK_SIZE_UNIT: usize = 1024;
 
@@ -175,11 +182,13 @@ pub fn decode(window_sz2: u8, lookahead_sz2: u8, stdin: &mut impl Read, stdout: 
     }
 }
 
+#[cfg(feature = "std")]
 #[inline]
 fn read_in(stdin: &mut impl Read, buf: &mut [u8]) -> usize {
     stdin.read(buf).expect("Failed to read from stdin")
 }
 
+#[cfg(feature = "std")]
 #[inline]
 fn write_out(stdout: &mut impl Write, data: &[u8]) {
     stdout.write_all(data).expect("Failed to write to stdout");

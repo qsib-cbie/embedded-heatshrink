@@ -1,5 +1,7 @@
-// use alloc::vec;
-// use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
 
 use crate::{
     common::*, HEATSHRINK_MAX_WINDOW_BITS, HEATSHRINK_MIN_LOOKAHEAD_BITS,

@@ -3,7 +3,16 @@ name = "tsz-heatshrink"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+std = []
+
 [dependencies]
 
 [dev-dependencies]
 rayon = "1.10.0"
+
+[[bin]]
+name = "hsz"
+path = "src/bin/hsz.rs"
+required-features = ["std"]

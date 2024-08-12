@@ -1,5 +1,8 @@
-// use alloc::vec;
-// use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use core::cmp::min;
 use core::ptr;
 
@@ -544,7 +547,7 @@ impl HeatshrinkEncoder {
             // First operation: attempt to fill the remaining bits in the current byte
             // Determine how many bits can be inserted into the current byte
             let available_space = self.bit_index.trailing_zeros() as u8 + 1;
-            let bits_this_round = std::cmp::min(bits_left, available_space);
+            let bits_this_round = core::cmp::min(bits_left, available_space);
             let shift_amount = bits_left - bits_this_round;
 
             // Mask and shift to get the bits to insert into the current byte
