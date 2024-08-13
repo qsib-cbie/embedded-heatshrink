@@ -8,7 +8,7 @@
 use std::io::{self};
 use std::process;
 
-use tsz_heatshrink::*;
+use embedded_heatshrink::*;
 
 // chosen based on bar chart in 'average-compression-tsz-data.png'
 const DEFAULT_WINDOW_BITS: u8 = 9;
