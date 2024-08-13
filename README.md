@@ -1,3 +1,6 @@
+[![Crate](https://img.shields.io/crates/v/embedded-heatshrink)](https://crates.io/crates/embedded-heatshrink)
+
+
 # Embedded Heatshrink
 
 This library is a rewrite/port of the C library [heatshrink](https://github.com/atomicobject/heatshrink). It has the same sink/poll API as the original library, but it is written in Rust. It is faster because of some optimizations for pushing bits and array manipulation. It fixes some bugs found during fuzzing.
